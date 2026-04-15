@@ -1,0 +1,2453 @@
+// RX SoftwareSerial: меньше — больше SRAM; при сбоях приёма поднять до 48–64
+#ifndef _SS_MAX_RX_BUFF
+#define _SS_MAX_RX_BUFF 32
+#endif
+#include <SoftwareSerial.h>
+#include <SPI.h>
+#include <ctype.h>
+#include <string.h>
+
+// ======================== Пины =========================
+#define SIM800_TX 2
+#define SIM800_RX 3
+#define SIM800_RST 5
+#define RELAY_OPEN 8
+#define RELAY_CLOSE 9
+#define FLASH_CS 10
+
+// ======================== Отладка ======================
+// С сайта через get_hash: serial_debug → UART; gateway_log_level → отправка action=log
+#ifndef ENABLE_DEBUG_LOGS
+#define ENABLE_DEBUG_LOGS 1
+#endif
+bool g_serialDebug = (ENABLE_DEBUG_LOGS != 0);
+uint8_t g_gatewayLogLevel = 2;
+#define SIM800_VERBOSE // Раскомментируйте для подробных строк SIM800
+
+#if ENABLE_DEBUG_LOGS
+  #define DEBUG_PRINT(x)    do { if (g_serialDebug) Serial.print(x); } while (0)
+  #define DEBUG_PRINTLN(x)  do { if (g_serialDebug) Serial.println(x); } while (0)
+#else
+  #define DEBUG_PRINT(x)    do { } while (0)
+  #define DEBUG_PRINTLN(x)  do { } while (0)
+#endif
+
+#if defined(SIM800_VERBOSE)
+  #define SIM800_LOG(line) do { if (g_serialDebug) { Serial.print(F("SIM800: ")); safePrintln(line); } } while (0)
+#else
+  #define SIM800_LOG(line) do { } while (0)
+#endif
+
+// Безопасная печать только печатных символов (чтобы не засорять лог)
+void safePrint(const char* s) {
+  while (*s) {
+    if (isPrintable((uint8_t)*s)) Serial.print(*s);
+    else Serial.print('.');
+    s++;
+  }
+}
+
+void safePrintln(const char* s) {
+  safePrint(s);
+  Serial.println();
+}
+
+static bool equalsIgnoreCase(const char* a, const char* b) {
+  if (!a || !b) return false;
+  while (*a && *b) {
+    if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return false;
+    a++;
+    b++;
+  }
+  return *a == '\0' && *b == '\0';
+}
+
+static void trimInPlace(char* s) {
+  if (!s) return;
+  int n = (int)strlen(s);
+  while (n > 0 && (s[n - 1] == '\r' || s[n - 1] == '\n' || s[n - 1] == ' ' || s[n - 1] == '\t')) {
+    s[--n] = '\0';
+  }
+  char* p = s;
+  while (*p == ' ' || *p == '\r' || *p == '\n' || *p == '\t') p++;
+  if (p != s) memmove(s, p, strlen(p) + 1);
+}
+
+bool isHexToken32(const char* s) {
+  if (!s) return false;
+  for (uint8_t i = 0; i < 32; i++) {
+    char c = s[i];
+    bool ok = ((c >= '0' && c <= '9') ||
+               (c >= 'a' && c <= 'f') ||
+               (c >= 'A' && c <= 'F'));
+    if (!ok) return false;
+  }
+  return s[32] == '\0';
+}
+
+// ======================== Константы ====================
+#define RECORD_SIZE 17
+#define MAX_PHONE_LEN 15
+#define PHONE_RECORDS_CAP 10000
+#define PHONE_TABLE_BYTES ((uint32_t)PHONE_RECORDS_CAP * RECORD_SIZE)
+// Заголовок в секторе 0 (0x0000..0x0FFF). Записи — со 2-го сектора, иначе
+// writeHeader() делает Sector Erase по 0x0000 и стирает только что записанные номера.
+#define FLASH_SECTOR_SIZE 4096UL
+#define FLASH_HEADER_ADDR 0UL
+#define FLASH_DATA_BASE FLASH_SECTOR_SIZE /* 0x1000 */
+// Вторая копия таблицы (выровнена по сектору): пересборка при смене группы без NOR-patch и без полного HTTP.
+#define PHONE_TABLE_SECTOR_ALIGN (((PHONE_TABLE_BYTES + FLASH_SECTOR_SIZE - 1) / FLASH_SECTOR_SIZE) * FLASH_SECTOR_SIZE)
+#define FLASH_SHADOW_BASE (FLASH_DATA_BASE + PHONE_TABLE_SECTOR_ALIGN)
+#define FLASH_NUMBERS_END (FLASH_SHADOW_BASE + PHONE_TABLE_SECTOR_ALIGN)
+#define SYNC_INTERVAL 300000UL
+/* Минимум между HTTP get_data при пошаговой загрузке — loop() успевает обслужить URC/UART */
+#define NUMBER_DOWNLOAD_INTERVAL_MS 300UL
+/* Меньше записей за запрос — короче JSON, меньше httpBuffer (критично для ATmega328) */
+#define PAGE_LIMIT 2
+/* get_hash с api_token/next/relay — ~260+ байт JSON; уменьшать нельзя без правки API */
+#define HTTP_BUFFER_SIZE 264
+/* Порог «мало RAM»: после ужатия буферов держим ниже, иначе вечный skip HTTP */
+#define LOW_RAM_GUARD 72
+/* Лог JSON + очередь SMS с сервера (не одновременно) + USSD command_ack */
+#define LOG_JSON_BUF_SIZE 132
+
+
+// Сервер и APN (замените на свои)
+#define SERVER_URL "ugline.ru/testgate/api"
+#define API_TOKEN_FALLBACK "14ae481d827aa7dfc2b59265a9f1c422"
+#define APN "internet"          // Измените на APN вашего оператора
+#define APN_USER ""
+#define APN_PASS ""
+
+// ======================== Структуры ====================
+struct FlashHeader {
+  uint16_t magic;
+  uint8_t version;
+  uint16_t recordCount;
+  char hash[33];
+  char apiToken[33]; // Синхронизируется с сайта и хранится во Flash
+  uint32_t lastServerSyncTs; // server_time из get_hash — для дельта-sync (только изменённые строки)
+};
+
+// ======================== Глобальные переменные ========
+SoftwareSerial sim800(SIM800_TX, SIM800_RX);
+FlashHeader header;
+char callerNumber[17];
+bool delayActive = false;
+unsigned long delayTimer = 0;
+char delayedNumber[17];
+// Тайминги с сервера (get_hash): задержка группы 1, длительность импульса реле
+unsigned long g_relayDelayGroup1Ms = 300000UL;
+uint16_t g_relayPulseMs = 1000;
+unsigned long lastSync = 0;
+/* Пошаговая загрузка списка (раньше 281× HTTP блокировали loop и «вешали» шлюз) */
+bool g_numberDownloadActive = false;
+uint16_t g_numberDownloadPage = 1;
+uint16_t g_numberDownloadTotal = 0;
+unsigned long g_lastNumberDownloadMs = 0;
+bool g_syncFullListMode = true;
+uint8_t g_deltaSubPhase = 0;
+char httpBuffer[HTTP_BUFFER_SIZE];
+#define URL_BUF_SIZE 148
+char g_urlBuf[URL_BUF_SIZE];
+char g_ussdScratch[48];
+bool gprsReady = false;        // Флаг готовности GPRS
+bool lastHashHttpOk = false;
+
+// Счётчик перезагрузок (для диагностики)
+uint16_t bootCount = 0;
+int minFreeRam = 32767;
+
+/* Лог action=log, текст SMS из очереди команд, тело USSD command_ack — по очереди, не параллельно */
+char g_logJsonBuf[LOG_JSON_BUF_SIZE];
+char g_logEv[13];
+char g_logSt[11];
+char g_logDet[16];
+char g_simLineBuf[64];
+char g_apn[32] = APN;
+char g_apnUser[24] = APN_USER;
+char g_apnPass[24] = APN_PASS;
+
+// +CLIP приходит в waitForResponse/httpPost при перекрывающихся звонках — без очереди processCall не вызывается
+bool g_pendingProcessCall = false;
+// SMS, прочитанные во время pump (импульс реле), обрабатываем в loop
+int g_pendingSmsIndex = -1;
+void ensureApiTokenInHeader() {
+  if (!isHexToken32(header.apiToken)) {
+    strncpy_P(header.apiToken, PSTR(API_TOKEN_FALLBACK), sizeof(header.apiToken) - 1);
+    header.apiToken[sizeof(header.apiToken) - 1] = '\0';
+  }
+}
+
+// ======================== Прототипы ====================
+void initSIM800();
+void resetSIM();
+void initFlash();
+bool readHeader();
+bool writeHeader();
+bool eraseDataSectors();
+int findNumber(const char* number);
+int findPhoneIndex(const char* number);
+void removeRecordAtIndex(uint16_t index);
+void removePhoneByNumber(const char* number);
+bool upsertRecordFromPhone(const char* phone, uint8_t group);
+void applyServerTimeFromHttpBuffer();
+bool httpResponseRequiresFullSync();
+void startFullNumberDownloadAfterDeltaAbort();
+bool downloadDeltaRemovedPage(uint16_t page, bool& hasMore);
+bool downloadDeltaUpsertPage(uint16_t page, bool& hasMore);
+void parseAndApplyRemovedFromHttpBuffer();
+void readRecord(uint16_t index, char* phone, uint8_t* group);
+void readRecordAtBase(uint32_t base, uint16_t index, char* phone, uint8_t* group);
+void writeRecord(uint16_t index, const char* phone, uint8_t group);
+void writeRecordAtBase(uint32_t base, uint16_t index, const char* phone, uint8_t group);
+bool eraseFlashRange(uint32_t startInclusive, uint32_t endExclusive);
+bool rebuildPhoneTablePatchRow(uint16_t idx, const char* phone, uint8_t group);
+bool syncWithServer();
+bool checkHashSimple();
+void applySerialDebugFromHttpBuffer();
+void applyGatewayLogLevelFromHttpBuffer();
+void applyRelayConfigFromHttpBuffer();
+void applyApiTokenFromHttpBuffer();
+bool continueNumberDownload();
+bool completeNumberDownload();
+bool downloadPage(int page, int& recordsLoaded, bool& hasMore);
+void processCall();
+void processSMS(int index);
+void checkServerCommands();
+void sendLog_P(const __FlashStringHelper* type, const char* number, int group, const __FlashStringHelper* status, const __FlashStringHelper* details);
+void sendLog_Str(const __FlashStringHelper* type, const char* number, int group, const __FlashStringHelper* status, const char* details);
+void openGate();
+void closeGate();
+void cancelDelay();
+void handleIncomingData();
+bool httpGet(const char* url);
+bool httpPost(const char* url, const char* data);
+bool waitForResponse(const char* expected, int timeout, bool printLines = false);
+bool waitForNetwork();
+bool initGPRS();
+void flushSIM800();
+int freeRam();
+bool isRamLow();
+void normalizePhone(const char* src, char* dst, size_t dstSize);
+void parseClipNumber(const char* line, char* out, size_t outSize);
+void captureClipFromLine(const char* line);
+void pumpSim800ClipWhile(unsigned long totalMs, bool acceptIncomingCallClip);
+void pumpSim800OnePass(bool acceptIncomingCallClip);
+void dumpNumbersFromFlash();
+bool waitFlashReady(unsigned long timeoutMs = 5000UL);
+bool flashWriteEnable();
+bool flashWriteBytes(uint32_t addr, const uint8_t* data, uint16_t len);
+bool flashSectorErase(uint32_t addr);
+bool flashReadBytes(uint32_t addr, uint8_t* buf, uint16_t len);
+
+// ======================== Setup =========================
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  bootCount++;
+  DEBUG_PRINT(F("=== GSM Gateway Starting (boot #"));
+  DEBUG_PRINT(bootCount);
+  DEBUG_PRINTLN(F(") ==="));
+  DEBUG_PRINTLN(F("Serial baud: 115200"));
+  int fr = freeRam();
+  if (fr < minFreeRam) minFreeRam = fr;
+  DEBUG_PRINT(F("freeRam at boot: "));
+  DEBUG_PRINTLN(fr);
+
+  pinMode(SIM800_RST, OUTPUT);
+  digitalWrite(SIM800_RST, HIGH);
+
+  pinMode(RELAY_OPEN, OUTPUT);
+  pinMode(RELAY_CLOSE, OUTPUT);
+  digitalWrite(RELAY_OPEN, HIGH);
+  digitalWrite(RELAY_CLOSE, HIGH);
+
+  initFlash();
+  if (!readHeader()) {
+    DEBUG_PRINTLN(F("Initializing new Flash header"));
+    memset(&header, 0, sizeof(header));
+    header.magic = 0xAA55;
+    header.version = 0x05;
+    header.recordCount = 0;
+    header.hash[0] = '\0';
+    header.lastServerSyncTs = 0;
+    strncpy_P(header.apiToken, PSTR(API_TOKEN_FALLBACK), sizeof(header.apiToken) - 1);
+    header.apiToken[sizeof(header.apiToken) - 1] = '\0';
+    writeHeader();
+  } else {
+    if (header.version == 0x01 || header.version == 0x02 || header.version == 0x03) {
+      // Миграция заголовка старого формата на v4.
+      header.version = 0x04;
+      ensureApiTokenInHeader();
+      writeHeader();
+    }
+    if (header.version == 0x04) {
+      header.lastServerSyncTs = 0;
+      header.version = 0x05;
+      ensureApiTokenInHeader();
+      writeHeader();
+    } else {
+      ensureApiTokenInHeader();
+    }
+    DEBUG_PRINT(F("Loaded header. Records: "));
+    DEBUG_PRINTLN(header.recordCount);
+  }
+  DEBUG_PRINT(F("API token source: "));
+  DEBUG_PRINTLN(isHexToken32(header.apiToken) ? F("SPI flash") : F("fallback"));
+
+  initSIM800();
+  fr = freeRam();
+  if (fr < minFreeRam) minFreeRam = fr;
+  DEBUG_PRINT(F("freeRam after SIM init: "));
+  DEBUG_PRINTLN(fr);
+
+  // Первую синхронизацию выполняем в loop:
+  // после полного выхода из setup стек меньше, модуль работает стабильнее.
+  if (!gprsReady) {
+    DEBUG_PRINTLN(F("GPRS not ready, initial sync deferred"));
+  }
+  lastSync = millis() - SYNC_INTERVAL; // принудить sync в первом проходе loop
+}
+
+// ======================== Main Loop =====================
+void loop() {
+  // 1) Сначала всегда разгребаем входящие URC от модема (+CLIP/+CMTI и т.д.),
+  // иначе длинные операции HTTP могут привести к пропуску события.
+  handleIncomingData();
+
+  while (g_pendingProcessCall) {
+    g_pendingProcessCall = false;
+    if (callerNumber[0] != '\0') {
+      processCall();
+    }
+  }
+
+  if (g_pendingSmsIndex >= 0) {
+    int idx = g_pendingSmsIndex;
+    g_pendingSmsIndex = -1;
+    processSMS(idx);
+  }
+
+  // 2) Пошаговая загрузка данных: только 1 страница за проход loop.
+  // Это критично для UNO: устройство остаётся отзывчивым к звонкам/SMS.
+  {
+    if (g_numberDownloadActive && gprsReady) {
+      if (!isRamLow()) {
+        if (g_lastNumberDownloadMs == 0UL || (millis() - g_lastNumberDownloadMs >= NUMBER_DOWNLOAD_INTERVAL_MS)) {
+          g_lastNumberDownloadMs = millis();
+          continueNumberDownload();
+        }
+      }
+    }
+  }
+
+  if (delayActive && (millis() - delayTimer >= g_relayDelayGroup1Ms)) {
+    DEBUG_PRINTLN(F("Delay expired, opening gate"));
+    openGate();
+    sendLog_P(F("open"), delayedNumber, 1, F("success"), F("dly"));
+    delayActive = false;
+    delayedNumber[0] = '\0';
+  }
+
+  // 3) Периодическая синхронизация и команды сервера.
+  if (millis() - lastSync >= SYNC_INTERVAL) {
+    if (!g_numberDownloadActive) {
+      DEBUG_PRINTLN(F("Periodic sync"));
+      int fr = freeRam();
+      if (fr < minFreeRam) minFreeRam = fr;
+      DEBUG_PRINT(F("freeRam before sync: "));
+      DEBUG_PRINTLN(fr);
+      DEBUG_PRINT(F("minFreeRam: "));
+      DEBUG_PRINTLN(minFreeRam);
+      if (isRamLow()) {
+        DEBUG_PRINTLN(F("Low RAM guard: skip sync cycle"));
+        lastSync = millis();
+        delay(10);
+        return;
+      }
+      if (gprsReady) {
+        syncWithServer();
+        checkServerCommands();
+      } else {
+        DEBUG_PRINTLN(F("GPRS not ready, trying to re-init"));
+        gprsReady = initGPRS();
+      }
+      lastSync = millis();
+    }
+  }
+
+  delay(10);
+}
+
+// ======================== Сброс SIM800 ==================
+void resetSIM() {
+  DEBUG_PRINTLN(F("Resetting SIM800L..."));
+  digitalWrite(SIM800_RST, LOW);
+  delay(200);          // Увеличено для надёжности
+  digitalWrite(SIM800_RST, HIGH);
+  delay(5000);         // Ждём полной загрузки (обычно 3-5 сек)
+  DEBUG_PRINTLN(F("SIM800L reset done"));
+}
+
+// ======================== Ожидание регистрации в сети ===
+bool waitForNetwork() {
+  DEBUG_PRINTLN(F("Waiting for network registration..."));
+  // Включаем URC, чтобы модуль сам прислал +CREG/+CGREG при изменении статуса.
+  // Это гораздо надёжнее под нагрузкой (DEBUG), чем частые AT+CREG? + парсинг через String.
+  flushSIM800();
+  sim800.println(F("AT+CREG=1"));
+  waitForResponse("OK", 2000, false);
+  sim800.println(F("AT+CGREG=1"));
+  waitForResponse("OK", 2000, false);
+
+  // Периодически опрашиваем, если URC не пришли.
+  unsigned long startAll = millis();
+  unsigned long lastPoll = 0;
+  int lastStat = -1;
+
+  while (millis() - startAll < 60000UL) { // до 60 секунд на регистрацию
+    if (millis() - lastPoll >= 5000UL) {
+      lastPoll = millis();
+      sim800.println(F("AT+CREG?"));
+      sim800.println(F("AT+CGREG?"));
+    }
+
+    if (!sim800.available()) {
+      delay(10);
+      continue;
+    }
+
+    int n = sim800.readBytesUntil('\n', g_simLineBuf, sizeof(g_simLineBuf) - 1);
+    g_simLineBuf[n] = '\0';
+    // trim CR/LF и пробелы
+    while (n > 0 && (g_simLineBuf[n - 1] == '\r' || g_simLineBuf[n - 1] == '\n' || g_simLineBuf[n - 1] == ' ')) {
+      g_simLineBuf[--n] = '\0';
+    }
+    char* p = g_simLineBuf;
+    while (*p == ' ' || *p == '\r') p++;
+    if (*p == '\0') continue;
+
+    // Сильно не шумим в логах: печатаем только CREG/CGREG и только в DEBUG.
+    if (strncmp_P(p, PSTR("+CREG:"), 6) == 0 || strncmp_P(p, PSTR("+CGREG:"), 7) == 0) {
+      if (g_serialDebug) {
+        DEBUG_PRINT(F("NET: "));
+        safePrintln(p);
+      }
+
+      // Формат: +CREG: <n>,<stat>[,...]  или +CREG: <stat> (реже)
+      char* comma = strchr(p, ',');
+      int stat = -1;
+      if (comma) stat = atoi(comma + 1);
+      else {
+        // пробуем второй формат
+        char* colon = strchr(p, ':');
+        if (colon) stat = atoi(colon + 1);
+      }
+
+      if (stat != -1 && stat != lastStat) {
+        lastStat = stat;
+        DEBUG_PRINT(F("Registration status: "));
+        DEBUG_PRINTLN(stat);
+      }
+
+      if (stat == 1 || stat == 5) {
+        DEBUG_PRINTLN(F("Registered in network"));
+        return true;
+      }
+    }
+  }
+
+  DEBUG_PRINTLN(F("Network registration failed (timeout)"));
+  return false;
+}
+
+// ======================== Инициализация GPRS ============
+bool initGPRS() {
+  DEBUG_PRINTLN(F("Configuring GPRS..."));
+  // Параметры подключения пытаемся получить у сети/оператора, иначе fallback на compile-time APN.
+  strncpy(g_apn, APN, sizeof(g_apn) - 1);
+  g_apn[sizeof(g_apn) - 1] = '\0';
+  strncpy(g_apnUser, APN_USER, sizeof(g_apnUser) - 1);
+  g_apnUser[sizeof(g_apnUser) - 1] = '\0';
+  strncpy(g_apnPass, APN_PASS, sizeof(g_apnPass) - 1);
+  g_apnPass[sizeof(g_apnPass) - 1] = '\0';
+  DEBUG_PRINT(F("GPRS profile APN=")); DEBUG_PRINTLN(g_apn);
+
+  // Под DEBUG SoftwareSerial легко "захлебывается" — проверим, что модем жив.
+  sim800.println(F("AT"));
+  if (!waitForResponse("OK", 3000, false)) {
+    DEBUG_PRINTLN(F("Modem not ready before GPRS"));
+    return false;
+  }
+
+  // Закрываем старый контекст (не всегда отвечает OK, поэтому без ожидания)
+  sim800.println(F("AT+SAPBR=0,1"));
+  delay(500);
+  flushSIM800();
+
+  // CONTYPE иногда не ставится с первого раза
+  bool conTypeOk = false;
+  for (uint8_t i = 0; i < 3; i++) {
+    flushSIM800();
+    sim800.println(F("AT+SAPBR=3,1,\"CONTYPE\",\"GPRS\""));
+    if (waitForResponse("OK", 5000, false)) {
+      conTypeOk = true;
+      break;
+    }
+    DEBUG_PRINTLN(F("CONTYPE set failed, retrying..."));
+    flushSIM800();
+    sim800.println(F("AT+SAPBR=0,1"));
+    delay(1000);
+    flushSIM800();
+  }
+  if (!conTypeOk) {
+    DEBUG_PRINTLN(F("Failed to set CONTYPE"));
+    return false;
+  }
+
+  // APN иногда не ставится с первого раза.
+  flushSIM800();
+  bool apnOk = false;
+  for (uint8_t i = 0; i < 3; i++) {
+    flushSIM800();
+    sim800.print(F("AT+SAPBR=3,1,\"APN\",\""));
+    sim800.print(g_apn);
+    sim800.println(F("\""));
+    if (waitForResponse("OK", 7000, false)) {
+      apnOk = true;
+      break;
+    }
+
+    DEBUG_PRINTLN(F("APN set failed, retrying..."));
+    flushSIM800();
+    sim800.println(F("AT+SAPBR=0,1"));
+    delay(1000);
+    flushSIM800();
+    sim800.println(F("AT+SAPBR=3,1,\"CONTYPE\",\"GPRS\""));
+    waitForResponse("OK", 5000, false);
+    delay(500);
+  }
+  if (!apnOk) {
+    DEBUG_PRINTLN(F("Failed to set APN"));
+    return false;
+  }
+
+  // USER/PASS — из профиля оператора (если определились), иначе compile-time дефолт.
+  flushSIM800();
+  sim800.print(F("AT+SAPBR=3,1,\"USER\",\""));
+  sim800.print(g_apnUser);
+  sim800.println(F("\""));
+  waitForResponse("OK", 2000, false);
+  flushSIM800();
+  sim800.print(F("AT+SAPBR=3,1,\"PWD\",\""));
+  sim800.print(g_apnPass);
+  sim800.println(F("\""));
+  waitForResponse("OK", 2000, false);
+
+  // Пытаемся добиться packet attach (у некоторых операторов attach не мгновенный).
+  bool attached = false;
+  for (uint8_t i = 0; i < 5; i++) {
+    flushSIM800();
+    sim800.println(F("AT+CGATT?"));
+    if (waitForResponse("+CGATT: 1", 3000, false)) {
+      attached = true;
+      break;
+    }
+    flushSIM800();
+    sim800.println(F("AT+CGATT=1"));
+    waitForResponse("OK", 5000, false);
+    delay(1500);
+  }
+  if (!attached) {
+    DEBUG_PRINTLN(F("CGATT not attached yet (will try SAPBR anyway)"));
+  }
+
+  // Пытаемся активировать GPRS (до 3 попыток)
+  for (int attempt = 0; attempt < 3; attempt++) {
+    DEBUG_PRINT(F("GPRS activation attempt "));
+    DEBUG_PRINTLN(attempt + 1);
+    flushSIM800();
+    DEBUG_PRINTLN(F("SAPBR open..."));
+    sim800.println(F("AT+SAPBR=1,1"));
+    if (waitForResponse("OK", 45000, false)) {
+      // Проверяем получение IP
+      delay(1000);
+      flushSIM800();
+      sim800.println(F("AT+SAPBR=2,1"));
+      unsigned long start = millis();
+      bool gotIP = false;
+      while (millis() - start < 5000) {
+        if (sim800.available()) {
+          int len = sim800.readBytesUntil('\n', g_simLineBuf, sizeof(g_simLineBuf) - 1);
+          g_simLineBuf[len] = '\0';
+          if (strstr(g_simLineBuf, "+SAPBR:") != NULL && strchr(g_simLineBuf, '.') != NULL) {
+            gotIP = true;
+            DEBUG_PRINT(F("Got IP: "));
+            safePrintln(g_simLineBuf);
+            break;
+          }
+        }
+      }
+      if (gotIP) {
+        DEBUG_PRINTLN(F("GPRS activated successfully"));
+        return true;
+      } else {
+        DEBUG_PRINTLN(F("GPRS activated but no IP?"));
+        // Всё равно считаем успехом, возможно IP придёт позже
+        return true;
+      }
+    }
+    // Сбрасываем bearer и пробуем ещё раз.
+    flushSIM800();
+    sim800.println(F("AT+SAPBR=0,1"));
+    waitForResponse("OK", 5000, false);
+    flushSIM800();
+    sim800.println(F("AT+CGATT=1"));
+    waitForResponse("OK", 5000, false);
+    delay(5000);
+  }
+  DEBUG_PRINTLN(F("GPRS activation failed after 3 attempts"));
+  return false;
+}
+
+// ======================== Инициализация SIM800 ==========
+void initSIM800() {
+  DEBUG_PRINTLN(F("Initializing SIM800L..."));
+  resetSIM();
+
+  sim800.begin(9600);
+  sim800.listen();
+  sim800.setTimeout(1000);
+  delay(1000);
+  flushSIM800();
+
+  // Проверка связи (с несколькими попытками)
+  bool atOk = false;
+  for (int i = 0; i < 3; i++) {
+    sim800.println(F("AT"));
+    if (waitForResponse("OK", 3000)) {
+      atOk = true;
+      break;
+    }
+    delay(1000);
+  }
+  if (!atOk) {
+    DEBUG_PRINTLN(F("SIM800 not responding after 3 attempts!"));
+    return;
+  }
+  DEBUG_PRINTLN(F("SIM800 AT OK"));
+
+  sim800.println(F("ATE0"));
+  waitForResponse("OK", 2000);
+
+  // Ждём регистрации в сети (но не блокируем надолго)
+  if (!waitForNetwork()) {
+    DEBUG_PRINTLN(F("No network - check SIM and antenna"));
+  } else {
+    // Даём время для инициализации SMS/Call
+    delay(2000);
+  }
+
+  // Включение определения номера
+  sim800.println(F("AT+CLIP=1"));
+  waitForResponse("OK", 2000);
+
+  // Настройка SMS (память SIM — иначе +CMTI/CMGR могут не совпасть)
+  sim800.println(F("AT+CMGF=1"));
+  waitForResponse("OK", 2000);
+  sim800.println(F("AT+CSCS=\"GSM\""));
+  waitForResponse("OK", 2000);
+  sim800.println(F("AT+CPMS=\"SM\",\"SM\",\"SM\""));
+  waitForResponse("OK", 2000);
+  sim800.println(F("AT+CNMI=2,1,0,0,0"));
+  waitForResponse("OK", 2000);
+
+  /* GPRS обязателен для шлюза; откладывать из‑за isRamLow() нельзя — при типичных 60–90 байт freeRam сеть никогда не поднималась */
+  gprsReady = initGPRS();
+  if (!gprsReady) {
+    DEBUG_PRINTLN(F("GPRS init failed - HTTP will not work"));
+  } else {
+    DEBUG_PRINTLN(F("GPRS ready"));
+  }
+
+  DEBUG_PRINTLN(F("SIM800 initialization complete"));
+}
+
+// ======================== Инициализация SPI Flash =======
+void initFlash() {
+  SPI.begin();
+  pinMode(FLASH_CS, OUTPUT);
+  digitalWrite(FLASH_CS, HIGH);
+  delay(100);
+  DEBUG_PRINTLN(F("SPI Flash initialized"));
+}
+
+// Чтение заголовка (сектор 0, начало флеша)
+bool readHeader() {
+  uint32_t addr = FLASH_HEADER_ADDR;
+  digitalWrite(FLASH_CS, LOW);
+  SPI.transfer(0x03);
+  SPI.transfer((addr >> 16) & 0xFF);
+  SPI.transfer((addr >> 8) & 0xFF);
+  SPI.transfer(addr & 0xFF);
+  uint8_t* p = (uint8_t*)&header;
+  for (size_t i = 0; i < sizeof(header); i++) p[i] = SPI.transfer(0x00);
+  digitalWrite(FLASH_CS, HIGH);
+  return (header.magic == 0xAA55 && (header.version == 0x01 || header.version == 0x02 || header.version == 0x03 || header.version == 0x04 || header.version == 0x05));
+}
+
+// Запись заголовка
+bool writeHeader() {
+  if (!flashWriteEnable()) return false;
+
+  if (!waitFlashReady(5000)) return false;
+
+  digitalWrite(FLASH_CS, LOW);
+  SPI.transfer(0x20);
+  SPI.transfer(0x00);
+  SPI.transfer(0x00);
+  SPI.transfer(0x00);
+  digitalWrite(FLASH_CS, HIGH);
+
+  if (!waitFlashReady(5000)) return false;
+
+  return flashWriteBytes(FLASH_HEADER_ADDR, (const uint8_t*)&header, sizeof(header));
+}
+
+bool flashWriteEnable() {
+  digitalWrite(FLASH_CS, LOW);
+  SPI.transfer(0x06);
+  digitalWrite(FLASH_CS, HIGH);
+  return true;
+}
+
+bool waitFlashReady(unsigned long timeoutMs) {
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    digitalWrite(FLASH_CS, LOW);
+    SPI.transfer(0x05); // RDSR
+    uint8_t sr = SPI.transfer(0x00);
+    digitalWrite(FLASH_CS, HIGH);
+    if ((sr & 0x01) == 0) return true; // WIP=0
+    delay(1);
+  }
+  return false;
+}
+
+bool flashWriteBytes(uint32_t addr, const uint8_t* data, uint16_t len) {
+  uint16_t pos = 0;
+  while (pos < len) {
+    uint16_t pageOffset = addr & 0xFF;
+    uint16_t chunk = 258 - pageOffset;
+    if (chunk > (len - pos)) chunk = len - pos;
+
+    if (!flashWriteEnable()) return false;
+
+    digitalWrite(FLASH_CS, LOW);
+    SPI.transfer(0x02); // PAGE PROGRAM
+    SPI.transfer((addr >> 16) & 0xFF);
+    SPI.transfer((addr >> 8) & 0xFF);
+    SPI.transfer(addr & 0xFF);
+    for (uint16_t i = 0; i < chunk; i++) {
+      SPI.transfer(data[pos + i]);
+    }
+    digitalWrite(FLASH_CS, HIGH);
+
+    if (!waitFlashReady(1000)) return false;
+
+    addr += chunk;
+    pos += chunk;
+  }
+  return true;
+}
+
+bool flashSectorErase(uint32_t addr) {
+  if (!flashWriteEnable()) return false;
+  digitalWrite(FLASH_CS, LOW);
+  SPI.transfer(0x20);
+  SPI.transfer((addr >> 16) & 0xFF);
+  SPI.transfer((addr >> 8) & 0xFF);
+  SPI.transfer(addr & 0xFF);
+  digitalWrite(FLASH_CS, HIGH);
+  return waitFlashReady(5000);
+}
+
+bool flashReadBytes(uint32_t addr, uint8_t* buf, uint16_t len) {
+  digitalWrite(FLASH_CS, LOW);
+  SPI.transfer(0x03);
+  SPI.transfer((addr >> 16) & 0xFF);
+  SPI.transfer((addr >> 8) & 0xFF);
+  SPI.transfer(addr & 0xFF);
+  for (uint16_t i = 0; i < len; i++) buf[i] = SPI.transfer(0x00);
+  digitalWrite(FLASH_CS, HIGH);
+  return true;
+}
+
+bool eraseFlashRange(uint32_t startInclusive, uint32_t endExclusive) {
+  uint32_t a = startInclusive & ~(FLASH_SECTOR_SIZE - 1UL);
+  while (a < endExclusive) {
+    if (!flashSectorErase(a)) {
+      DEBUG_PRINTLN(F("Flash sector erase failed"));
+      return false;
+    }
+    a += FLASH_SECTOR_SIZE;
+  }
+  return true;
+}
+
+// Стирание секторов области номеров + теневой копии (не трогаем сектор 0 с заголовком)
+bool eraseDataSectors() {
+  if (!eraseFlashRange(FLASH_DATA_BASE, FLASH_NUMBERS_END)) return false;
+  DEBUG_PRINTLN(F("Data sectors erased"));
+  return true;
+}
+
+// Чтение записи (номер всегда через normalizePhone: мусор во флеше не попадает в сравнение/дамп как есть)
+void readRecordAtBase(uint32_t base, uint16_t index, char* phone, uint8_t* group) {
+  uint32_t addr = base + (uint32_t)index * RECORD_SIZE;
+  digitalWrite(FLASH_CS, LOW);
+  SPI.transfer(0x03);
+  SPI.transfer((addr >> 16) & 0xFF);
+  SPI.transfer((addr >> 8) & 0xFF);
+  SPI.transfer(addr & 0xFF);
+  uint8_t raw[16];
+  for (int i = 0; i < 15; i++) raw[i] = SPI.transfer(0x00);
+  raw[15] = '\0';
+  (void)SPI.transfer(0x00);
+  uint8_t gb = SPI.transfer(0x00);
+  digitalWrite(FLASH_CS, HIGH);
+  for (int i = 0; i < 15; i++) {
+    uint8_t c = raw[i];
+    if (c < 0x20 || c > 0x7E) raw[i] = ' ';
+  }
+  if (group) {
+    *group = (gb <= 1) ? gb : 0;
+  }
+  normalizePhone((const char*)raw, phone, 17);
+}
+
+void readRecord(uint16_t index, char* phone, uint8_t* group) {
+  readRecordAtBase(FLASH_DATA_BASE, index, phone, group);
+}
+
+// Запись записи (PAGE PROGRAM). NOR W25Q: только 1→0 без стирания; перезапись
+// уже запрограммированного байта (например группа 0→1) по месту не сработает.
+void writeRecordAtBase(uint32_t base, uint16_t index, const char* phone, uint8_t group) {
+  uint32_t addr = base + (uint32_t)index * RECORD_SIZE;
+  uint8_t buf[RECORD_SIZE];
+  memset(buf, 0, sizeof(buf));
+  if (phone) {
+    char normalized[17];
+    normalizePhone(phone, normalized, sizeof(normalized));
+    strncpy((char*)buf, normalized, 15);
+    buf[15] = '\0';
+  }
+  buf[16] = (group <= 1) ? group : 0;
+  if (!flashWriteBytes(addr, buf, sizeof(buf))) {
+    DEBUG_PRINTLN(F("Flash record write failed"));
+  }
+}
+
+void writeRecord(uint16_t index, const char* phone, uint8_t group) {
+  writeRecordAtBase(FLASH_DATA_BASE, index, phone, group);
+}
+
+// Пересборка таблицы: main → shadow (с правкой строки idx) → стирание main → shadow → main; без HTTP.
+bool rebuildPhoneTablePatchRow(uint16_t idx, const char* phone, uint8_t group) {
+  if (idx >= header.recordCount || phone == NULL) return false;
+  if (header.recordCount > PHONE_RECORDS_CAP) return false;
+  if (!eraseFlashRange(FLASH_SHADOW_BASE, FLASH_NUMBERS_END)) return false;
+  for (uint16_t i = 0; i < header.recordCount; i++) {
+    char ph[17];
+    uint8_t g = 0;
+    if (i == idx) {
+      normalizePhone(phone, ph, sizeof(ph));
+      g = (group <= 1) ? group : 0;
+    } else {
+      readRecordAtBase(FLASH_DATA_BASE, i, ph, &g);
+    }
+    writeRecordAtBase(FLASH_SHADOW_BASE, i, ph, g);
+  }
+  if (!eraseFlashRange(FLASH_DATA_BASE, FLASH_SHADOW_BASE)) return false;
+  for (uint16_t i = 0; i < header.recordCount; i++) {
+    char ph[17];
+    uint8_t g = 0;
+    readRecordAtBase(FLASH_SHADOW_BASE, i, ph, &g);
+    writeRecordAtBase(FLASH_DATA_BASE, i, ph, g);
+  }
+  (void)eraseFlashRange(FLASH_SHADOW_BASE, FLASH_NUMBERS_END);
+  return true;
+}
+
+// Поиск номера: группа или -1 (та же нормализация, что и в findPhoneIndex)
+int findNumber(const char* number) {
+  int idx = findPhoneIndex(number);
+  if (idx < 0) return -1;
+  char phone[17];
+  uint8_t group = 0;
+  readRecord((uint16_t)idx, phone, &group);
+  return (int)group;
+}
+
+int findPhoneIndex(const char* number) {
+  if (header.recordCount == 0) return -1;
+  char target[17];
+  normalizePhone(number, target, sizeof(target));
+  char currPhone[17];
+  uint8_t group = 0;
+  for (uint16_t i = 0; i < header.recordCount; i++) {
+    readRecord(i, currPhone, &group);
+    if (strcmp(target, currPhone) == 0) return (int)i;
+  }
+  return -1;
+}
+
+void removeRecordAtIndex(uint16_t index) {
+  if (header.recordCount == 0 || index >= header.recordCount) return;
+  if (header.recordCount == 1) {
+    header.recordCount = 0;
+    return;
+  }
+  if (index != header.recordCount - 1) {
+    char lastPhone[17];
+    uint8_t g = 0;
+    readRecord(header.recordCount - 1, lastPhone, &g);
+    writeRecord(index, lastPhone, g);
+  }
+  header.recordCount--;
+}
+
+void removePhoneByNumber(const char* number) {
+  int idx = findPhoneIndex(number);
+  if (idx >= 0) removeRecordAtIndex((uint16_t)idx);
+}
+
+bool upsertRecordFromPhone(const char* phone, uint8_t group) {
+  int idx = findPhoneIndex(phone);
+  if (idx >= 0) {
+    char curPhone[17];
+    uint8_t g0 = 0;
+    readRecord((uint16_t)idx, curPhone, &g0);
+    if (g0 == (uint8_t)group) {
+      return true;
+    }
+    // В NOR flash нельзя безопасно "подправить байт" в существующей записи
+    // (без erase допускается только 1->0). Поэтому patch идёт через rebuild:
+    // main -> shadow (с изменением) -> erase main -> copy back.
+    if (!rebuildPhoneTablePatchRow((uint16_t)idx, phone, group)) {
+      DEBUG_PRINTLN(F("upsert: flash rebuild failed, full HTTP resync"));
+      startFullNumberDownloadAfterDeltaAbort();
+      return false;
+    }
+    return true;
+  }
+  writeRecord(header.recordCount, phone, (uint8_t)group);
+  header.recordCount++;
+  return true;
+}
+
+void applyServerTimeFromHttpBuffer() {
+  char* p = strstr(httpBuffer, "\"server_time\":");
+  if (!p) return;
+  p += 14;
+  while (*p == ' ' || *p == '\t') p++;
+  unsigned long t = (unsigned long)atol(p);
+  if (t > 0UL) header.lastServerSyncTs = (uint32_t)t;
+}
+
+bool httpResponseRequiresFullSync() {
+  return strstr(httpBuffer, "\"full_sync_required\":true") != NULL;
+}
+
+void startFullNumberDownloadAfterDeltaAbort() {
+  g_syncFullListMode = true;
+  g_deltaSubPhase = 0;
+  g_numberDownloadPage = 1;
+  g_numberDownloadTotal = 0;
+  if (!eraseDataSectors()) {
+    g_numberDownloadActive = false;
+    return;
+  }
+  header.recordCount = 0;
+  DEBUG_PRINTLN(F("Delta aborted: full list sync"));
+}
+
+// ======================== Синхронизация с сервером =====
+bool syncWithServer() {
+  DEBUG_PRINTLN(F("Checking server sync..."));
+  if (!gprsReady) {
+    DEBUG_PRINTLN(F("GPRS not ready, skipping sync"));
+    return false;
+  }
+  bool hashMatch = checkHashSimple();
+  if (!lastHashHttpOk) {
+    DEBUG_PRINTLN(F("Hash check failed (transport), skip full download"));
+    return false;
+  }
+  if (!hashMatch) {
+    DEBUG_PRINTLN(F("Hash mismatch, downloading numbers (non-blocking)..."));
+    // При наличии server_time из предыдущих sync пробуем delta:
+    // меньше трафика и меньше времени "занятости" модема.
+    if (header.version >= 0x05 && header.lastServerSyncTs > 0UL) {
+      g_syncFullListMode = false;
+      g_deltaSubPhase = 0;
+      g_numberDownloadTotal = 0;
+      g_numberDownloadPage = 1;
+      g_numberDownloadActive = true;
+      g_lastNumberDownloadMs = 0UL;
+      DEBUG_PRINTLN(F("Delta sync (changed rows only)"));
+      return true;
+    }
+    g_syncFullListMode = true;
+    g_deltaSubPhase = 0;
+    if (!eraseDataSectors()) return false;
+    g_numberDownloadPage = 1;
+    g_numberDownloadTotal = 0;
+    g_numberDownloadActive = true;
+    g_lastNumberDownloadMs = 0UL;
+    DEBUG_PRINTLN(F("Full list sync (erase + all pages)"));
+    return true;
+  }
+  DEBUG_PRINTLN(F("Hash match, no update needed"));
+  return true;
+}
+
+void applySerialDebugFromHttpBuffer() {
+  const char* p = strstr(httpBuffer, "\"serial_debug\":");
+  if (!p) return;
+  p += 15; // длина "serial_debug":
+  while (*p == ' ' || *p == '\t') p++;
+  if (strncmp_P(p, PSTR("true"), 4) == 0) {
+    g_serialDebug = true;
+    return;
+  }
+  if (strncmp_P(p, PSTR("false"), 5) == 0) {
+    g_serialDebug = false;
+    return;
+  }
+  if (*p == '1') g_serialDebug = true;
+  else if (*p == '0') g_serialDebug = false;
+}
+
+void applyGatewayLogLevelFromHttpBuffer() {
+  const char* p = strstr(httpBuffer, "\"gateway_log_level\":");
+  if (!p) return;
+  p += 20;
+  while (*p == ' ' || *p == '\t') p++;
+  int v = atoi(p);
+  if (v < 0) v = 0;
+  if (v > 2) v = 2;
+  g_gatewayLogLevel = (uint8_t)v;
+}
+
+void applyRelayConfigFromHttpBuffer() {
+  const char* p = strstr(httpBuffer, "\"relay_delay_group1_ms\":");
+  if (p) {
+    p += 24; // длина `"relay_delay_group1_ms":` (имя 21 символ)
+    while (*p == ' ' || *p == '\t') p++;
+    unsigned long v = (unsigned long)atol(p);
+    if (v >= 10000UL && v <= 86400000UL)
+      g_relayDelayGroup1Ms = v;
+  }
+  p = strstr(httpBuffer, "\"relay_pulse_ms\":");
+  if (p) {
+    p += 17; // "relay_pulse_ms":
+    while (*p == ' ' || *p == '\t') p++;
+    unsigned long v = (unsigned long)atol(p);
+    if (v >= 100UL && v <= 60000UL)
+      g_relayPulseMs = (uint16_t)v;
+  }
+}
+
+void applyApiTokenFromHttpBuffer() {
+  char* p = strstr(httpBuffer, "\"api_token\":\"");
+  if (!p) return;
+  p += 13; // "api_token":
+  char* q = strchr(p, '"');
+  if (!q) return;
+  int len = (int)(q - p);
+  if (len != 32) return;
+  char t[33];
+  memcpy(t, p, 32);
+  t[32] = '\0';
+  if (!isHexToken32(t)) return;
+  if (strncmp(header.apiToken, t, sizeof(header.apiToken)) == 0) return;
+  strncpy(header.apiToken, t, sizeof(header.apiToken) - 1);
+  header.apiToken[sizeof(header.apiToken) - 1] = '\0';
+  if (writeHeader()) {
+    DEBUG_PRINTLN(F("API token synced to SPI flash"));
+  } else {
+    DEBUG_PRINTLN(F("API token sync failed (flash write)"));
+  }
+}
+
+// Упрощённая проверка хеша (без JSON)
+bool checkHashSimple() {
+  lastHashHttpOk = false;
+  sprintf_P(g_urlBuf, PSTR("http://%s/?action=get_hash"), SERVER_URL);
+  if (!httpGet(g_urlBuf)) {
+    DEBUG_PRINTLN(F("HTTP get_hash failed"));
+    return false;
+  }
+
+  applySerialDebugFromHttpBuffer();
+  applyGatewayLogLevelFromHttpBuffer();
+  applyRelayConfigFromHttpBuffer();
+  applyApiTokenFromHttpBuffer();
+
+  char* hashStart = strstr(httpBuffer, "\"hash\":\"");
+  if (!hashStart) {
+    DEBUG_PRINTLN(F("Hash not found in response"));
+    return false;
+  }
+  hashStart += 8;
+  char* hashEnd = strchr(hashStart, '"');
+  if (!hashEnd) return false;
+  int len = (int)(hashEnd - hashStart);
+  if (len > 32) len = 32;
+
+  bool match = (strncmp(header.hash, hashStart, (size_t)len) == 0 && header.hash[len] == '\0');
+  DEBUG_PRINT(F("Local hash: ")); DEBUG_PRINTLN(header.hash);
+  char serverHash[33];
+  memcpy(serverHash, hashStart, len);
+  serverHash[len] = '\0';
+  DEBUG_PRINT(F("Server hash: ")); DEBUG_PRINTLN(serverHash);
+  lastHashHttpOk = true;
+  if (match) {
+    uint32_t prevTs = header.lastServerSyncTs;
+    applyServerTimeFromHttpBuffer();
+    if (header.lastServerSyncTs != prevTs) writeHeader();
+  }
+  return match;
+}
+
+// Финал пошаговой загрузки: хеш в заголовок, запись во Flash
+bool completeNumberDownload() {
+  if (g_syncFullListMode) {
+    header.recordCount = g_numberDownloadTotal;
+  }
+  DEBUG_PRINT(F("Total records: "));
+  DEBUG_PRINTLN(header.recordCount);
+
+  sprintf_P(g_urlBuf, PSTR("http://%s/?action=get_hash"), SERVER_URL);
+  if (httpGet(g_urlBuf)) {
+    applySerialDebugFromHttpBuffer();
+    applyGatewayLogLevelFromHttpBuffer();
+    applyRelayConfigFromHttpBuffer();
+    applyApiTokenFromHttpBuffer();
+    applyServerTimeFromHttpBuffer();
+    char* hashStart = strstr(httpBuffer, "\"hash\":\"");
+    if (hashStart) {
+      hashStart += 8;
+      char* hashEnd = strchr(hashStart, '"');
+      if (hashEnd) {
+        int len = hashEnd - hashStart;
+        if (len > 32) len = 32;
+        strncpy(header.hash, hashStart, len);
+        header.hash[len] = '\0';
+      }
+    }
+  }
+
+  writeHeader();
+  g_numberDownloadActive = false;
+  g_syncFullListMode = true;
+  g_deltaSubPhase = 0;
+
+  if (g_gatewayLogLevel > 0) {
+    sendLog_P(F("sync"), NULL, -1, F("success"), F("ok"));
+  }
+  dumpNumbersFromFlash();
+  DEBUG_PRINTLN(F("Sync completed successfully"));
+  lastSync = millis();
+  return true;
+}
+
+// Одна страница за вызов — вызывается из loop(), между страницами обрабатываются URC
+bool continueNumberDownload() {
+  if (!g_numberDownloadActive) return true;
+  if (!gprsReady) return false;
+  if (isRamLow()) {
+    DEBUG_PRINTLN(F("Low RAM: pause number download"));
+    return false;
+  }
+
+  handleIncomingData();
+  flushSIM800();
+
+  if (g_syncFullListMode) {
+    int recordsLoaded = 0;
+    bool hasMore = false;
+    if (!downloadPage(g_numberDownloadPage, recordsLoaded, hasMore)) {
+      DEBUG_PRINT(F("Page "));
+      DEBUG_PRINT(g_numberDownloadPage);
+      DEBUG_PRINTLN(F(" download failed (will retry)"));
+      return false;
+    }
+
+    DEBUG_PRINT(F("Page "));
+    DEBUG_PRINT(g_numberDownloadPage);
+    DEBUG_PRINT(F(" loaded "));
+    DEBUG_PRINT(recordsLoaded);
+    DEBUG_PRINTLN(F(" records"));
+
+    g_numberDownloadTotal += recordsLoaded;
+    header.recordCount = g_numberDownloadTotal;
+
+    if (!hasMore) {
+      return completeNumberDownload();
+    }
+
+    g_numberDownloadPage++;
+    return true;
+  }
+
+  if (g_deltaSubPhase == 0) {
+    bool hasMoreRm = false;
+    if (!downloadDeltaRemovedPage(g_numberDownloadPage, hasMoreRm)) {
+      DEBUG_PRINTLN(F("Delta removed batch failed (will retry)"));
+      return false;
+    }
+    if (g_syncFullListMode) {
+      return true;
+    }
+    if (!hasMoreRm) {
+      g_deltaSubPhase = 1;
+      g_numberDownloadPage = 1;
+    } else {
+      g_numberDownloadPage++;
+    }
+    return true;
+  }
+
+  bool hasMoreUp = false;
+  if (!downloadDeltaUpsertPage(g_numberDownloadPage, hasMoreUp)) {
+    DEBUG_PRINTLN(F("Delta upsert batch failed (will retry)"));
+    return false;
+  }
+  if (g_syncFullListMode) {
+    return true;
+  }
+  if (!hasMoreUp) {
+    return completeNumberDownload();
+  }
+  g_numberDownloadPage++;
+  return true;
+}
+
+void parseAndApplyRemovedFromHttpBuffer() {
+  char* r = strstr(httpBuffer, "\"removed\":[");
+  if (!r) return;
+  r += 11;
+  while (*r && *r != ']') {
+    while (*r && *r != '"' && *r != ']') r++;
+    if (*r == ']') break;
+    if (*r != '"') break;
+    r++;
+    char phone[17];
+    int i = 0;
+    while (*r && *r != '"' && i < 16) phone[i++] = *r++;
+    phone[i] = '\0';
+    if (phone[0] != '\0') removePhoneByNumber(phone);
+    if (*r == '"') r++;
+    while (*r && (*r == ',' || *r == ' ' || *r == '\t' || *r == '\r' || *r == '\n')) r++;
+  }
+}
+
+bool downloadDeltaRemovedPage(uint16_t page, bool& hasMore) {
+  int urlLen = snprintf_P(g_urlBuf, sizeof(g_urlBuf),
+                           PSTR("http://%s/?action=get_data&hash=%s&delta=1&since_ts=%lu&batch=removed&page=%u&limit=%d"),
+                           SERVER_URL, header.hash, (unsigned long)header.lastServerSyncTs, (unsigned)page, 5);
+  if (urlLen <= 0 || urlLen >= (int)sizeof(g_urlBuf)) {
+    DEBUG_PRINTLN(F("delta removed URL failed"));
+    return false;
+  }
+  if (!httpGet(g_urlBuf)) return false;
+  if (httpResponseRequiresFullSync()) {
+    startFullNumberDownloadAfterDeltaAbort();
+    hasMore = false;
+    return true;
+  }
+  if (strstr(httpBuffer, "\"changed\":false") != NULL) {
+    hasMore = false;
+    return true;
+  }
+
+  int totalPages = 1;
+  char* tp = strstr(httpBuffer, "\"total_pages\":");
+  if (tp) totalPages = atoi(tp + 14);
+  if (totalPages < 1) totalPages = 1;
+  if ((int)page > totalPages) {
+    hasMore = false;
+    return true;
+  }
+  hasMore = ((int)page < totalPages);
+  parseAndApplyRemovedFromHttpBuffer();
+  return true;
+}
+
+bool downloadDeltaUpsertPage(uint16_t page, bool& hasMore) {
+  int urlLen = snprintf_P(g_urlBuf, sizeof(g_urlBuf),
+                           PSTR("http://%s/?action=get_data&hash=%s&delta=1&since_ts=%lu&batch=upserts&page=%u&limit=%d"),
+                           SERVER_URL, header.hash, (unsigned long)header.lastServerSyncTs, (unsigned)page, PAGE_LIMIT);
+  if (urlLen <= 0 || urlLen >= (int)sizeof(g_urlBuf)) {
+    DEBUG_PRINTLN(F("delta upsert URL failed"));
+    return false;
+  }
+  if (!httpGet(g_urlBuf)) return false;
+  if (httpResponseRequiresFullSync()) {
+    startFullNumberDownloadAfterDeltaAbort();
+    hasMore = false;
+    return true;
+  }
+  if (strstr(httpBuffer, "\"changed\":false") != NULL) {
+    hasMore = false;
+    return true;
+  }
+
+  int totalPages = 1;
+  char* tp = strstr(httpBuffer, "\"total_pages\":");
+  if (tp) totalPages = atoi(tp + 14);
+  if (totalPages < 1) totalPages = 1;
+  if ((int)page > totalPages) {
+    hasMore = false;
+    return true;
+  }
+  hasMore = ((int)page < totalPages);
+
+  char* p = httpBuffer;
+  while ((p = strstr(p, "\"phone\":\"")) != NULL) {
+    p += 9;
+    char* endPhone = strchr(p, '"');
+    if (!endPhone) break;
+
+    char phone[17];
+    int phoneLen = endPhone - p;
+    if (phoneLen > 16) phoneLen = 16;
+    if (phoneLen < 0) phoneLen = 0;
+    memcpy(phone, p, phoneLen);
+    phone[phoneLen] = '\0';
+
+    int group = 0;
+    char* g = strstr(endPhone, "\"group\":");
+    if (g) group = atoi(g + 8);
+
+    if (phone[0] != '\0') {
+      if (!upsertRecordFromPhone(phone, (uint8_t)group)) {
+        return true;
+      }
+    }
+    p = endPhone + 1;
+  }
+  return true;
+}
+
+// Загрузка одной страницы
+bool downloadPage(int page, int& recordsLoaded, bool& hasMore) {
+  int urlLen = snprintf_P(g_urlBuf, sizeof(g_urlBuf), PSTR("http://%s/?action=get_data&hash=%s&page=%d&limit=%d"),
+                          SERVER_URL, header.hash, page, PAGE_LIMIT);
+  if (urlLen <= 0 || urlLen >= (int)sizeof(g_urlBuf)) {
+    DEBUG_PRINTLN(F("get_data URL build failed"));
+    return false;
+  }
+
+  if (!httpGet(g_urlBuf)) return false;
+
+  // Упрощенный парсер JSON без выделений памяти: changed/total_pages/data[]
+  if (strstr(httpBuffer, "\"changed\":false") != NULL) {
+    hasMore = false;
+    recordsLoaded = 0;
+    return true;
+  }
+
+  int totalPages = 1;
+  char* tp = strstr(httpBuffer, "\"total_pages\":");
+  if (tp) totalPages = atoi(tp + 14);
+  if (totalPages < 1) totalPages = 1;
+  if (page > totalPages) {
+    hasMore = false;
+    recordsLoaded = 0;
+    return true;
+  }
+  hasMore = (page < totalPages);
+
+  int idx = (page - 1) * PAGE_LIMIT;
+  recordsLoaded = 0;
+
+  char* p = httpBuffer;
+  while ((p = strstr(p, "\"phone\":\"")) != NULL) {
+    p += 9;
+    char* endPhone = strchr(p, '"');
+    if (!endPhone) break;
+
+    char phone[17];
+    int phoneLen = endPhone - p;
+    if (phoneLen > 16) phoneLen = 16;
+    if (phoneLen < 0) phoneLen = 0;
+    memcpy(phone, p, phoneLen);
+    phone[phoneLen] = '\0';
+
+    int group = 0;
+    char* g = strstr(endPhone, "\"group\":");
+    if (g) group = atoi(g + 8);
+
+    if (phone[0] != '\0') {
+      writeRecord(idx, phone, (uint8_t)group);
+      idx++;
+      recordsLoaded++;
+    }
+    p = endPhone + 1;
+  }
+  return true;
+}
+
+// ======================== Обработка входящих данных =====
+void handleIncomingData() {
+  while (sim800.available()) {
+    memset(g_simLineBuf, 0, sizeof(g_simLineBuf));
+    int len = sim800.readBytesUntil('\n', g_simLineBuf, sizeof(g_simLineBuf) - 1);
+    g_simLineBuf[len] = '\0';
+    if (strlen(g_simLineBuf) == 0) continue;
+    captureClipFromLine(g_simLineBuf);
+    SIM800_LOG(g_simLineBuf);
+
+    if (strncmp_P(g_simLineBuf, PSTR("+CLIP:"), 6) == 0) {
+      if (callerNumber[0] != '\0') {
+        DEBUG_PRINT(F("Incoming call from: ")); DEBUG_PRINTLN(callerNumber);
+      }
+    }
+    else if (strncmp_P(g_simLineBuf, PSTR("+CMTI:"), 6) == 0) {
+      char* comma = strrchr(g_simLineBuf, ',');
+      if (comma) {
+        int index = atoi(comma + 1);
+        DEBUG_PRINT(F("New SMS stored at index: ")); DEBUG_PRINTLN(index);
+        processSMS(index);
+      }
+    }
+    else if (strstr(g_simLineBuf, "RDY") != NULL) {
+      DEBUG_PRINTLN(F("Module ready after reset"));
+    }
+    else if (strstr(g_simLineBuf, "SMS Ready") != NULL) {
+      DEBUG_PRINTLN(F("SMS Ready"));
+    }
+    else if (strstr(g_simLineBuf, "Call Ready") != NULL) {
+      DEBUG_PRINTLN(F("Call Ready"));
+    }
+    else if (strstr(g_simLineBuf, "NORMAL POWER DOWN") != NULL) {
+      DEBUG_PRINTLN(F("Module powering down"));
+    }
+  }
+}
+
+// Обработка звонка
+void processCall() {
+  // Не вызываем HTTP (sendLog) до ATH — иначе переполняется RX SoftwareSerial,
+  // URC +CLIP смешиваются с телом POST и в логе появляется JSON.
+
+  char num[17];
+  if (callerNumber[0] == '\0') return;
+  strncpy(num, callerNumber, sizeof(num));
+  num[sizeof(num) - 1] = '\0';
+
+  int group = findNumber(num);
+  if (group == -1) {
+    DEBUG_PRINTLN(F("Number not in list, rejecting"));
+    sim800.println(F("ATH"));
+    delay(400);
+    flushSIM800();
+    sendLog_P(F("call"), num, -1, F("rejected"), F("!list"));
+    callerNumber[0] = '\0';
+    g_pendingProcessCall = false;
+    return;
+  }
+
+  DEBUG_PRINT(F("Number found, group: ")); DEBUG_PRINTLN(group);
+
+  bool wasDelayActive = delayActive;
+  char prevDelayed[17];
+  prevDelayed[0] = '\0';
+  if (delayActive) {
+    strncpy(prevDelayed, delayedNumber, sizeof(prevDelayed) - 1);
+    prevDelayed[sizeof(prevDelayed) - 1] = '\0';
+  }
+
+  // Сразу сбрасываем линию: модем готов к следующему RING/+CLIP, RX не переполняется при втором звонке
+  sim800.println(F("ATH"));
+  delay(200);
+  flushSIM800();
+  /* Повторный +CLIP в UART после ATH не должен снова ставить очередь до конца обработки */
+  callerNumber[0] = '\0';
+
+  if (group == 0) {
+    DEBUG_PRINTLN(F("Group 0: opening gate immediately"));
+    openGate();
+    if (wasDelayActive) {
+      DEBUG_PRINTLN(F("Cancelling active delay"));
+      cancelDelay();
+    }
+  } else {
+    if (!delayActive) {
+      DEBUG_PRINTLN(F("Group 1: delay timer started"));
+      delayActive = true;
+      delayTimer = millis();
+      strncpy(delayedNumber, num, sizeof(delayedNumber) - 1);
+      delayedNumber[sizeof(delayedNumber) - 1] = '\0';
+    } else {
+      DEBUG_PRINTLN(F("Delay already active, ignoring call"));
+    }
+  }
+
+  sendLog_P(F("call"), num, -1, F("received"), F(""));
+  if (group == 0) {
+    sendLog_P(F("open"), num, 0, F("success"), F("now"));
+    if (wasDelayActive) {
+      sendLog_P(F("delay_cancel"), prevDelayed, 1, F("cancelled"), F("ovr0"));
+    }
+  } else {
+    if (!wasDelayActive) {
+      sendLog_P(F("delay_start"), num, 1, F("started"), F("g1"));
+    } else {
+      sendLog_P(F("call"), num, 1, F("ignored"), F("busy"));
+    }
+  }
+  callerNumber[0] = '\0';
+  g_pendingProcessCall = false;
+}
+
+void cancelDelay() {
+  delayActive = false;
+  delayedNumber[0] = '\0';
+}
+
+void openGate() {
+  DEBUG_PRINTLN(F("Opening gate"));
+  digitalWrite(RELAY_OPEN, LOW);
+  /* На время импульса не парсим +CLIP — помехи/хвост URC иначе снова ставят g_pendingProcessCall («перезвон») */
+  pumpSim800ClipWhile((unsigned long)g_relayPulseMs, false);
+  digitalWrite(RELAY_OPEN, HIGH);
+}
+
+void closeGate() {
+  DEBUG_PRINTLN(F("Closing gate"));
+  digitalWrite(RELAY_CLOSE, LOW);
+  pumpSim800ClipWhile((unsigned long)g_relayPulseMs, false);
+  digitalWrite(RELAY_CLOSE, HIGH);
+}
+
+// Обработка SMS
+void processSMS(int index) {
+  flushSIM800();
+  sim800.print(F("AT+CMGR="));
+  sim800.println(index);
+
+  char sender[16] = {0};
+  char msg[72] = {0};
+  bool inSender = false;
+  bool inMsg = false;
+  int msgIdx = 0;
+
+  unsigned long t0 = millis();
+  bool gotFinalOk = false;
+  while (millis() - t0 < 5000 && !gotFinalOk) {
+    while (sim800.available()) {
+      int len = sim800.readBytesUntil('\n', g_simLineBuf, sizeof(g_simLineBuf) - 1);
+      g_simLineBuf[len] = '\0';
+      while (len > 0 && (g_simLineBuf[len - 1] == '\r' || g_simLineBuf[len - 1] == ' ')) g_simLineBuf[--len] = '\0';
+      if (strlen(g_simLineBuf) == 0) continue;
+      DEBUG_PRINT(F("SMS part: ")); safePrintln(g_simLineBuf);
+
+      if (strcmp(g_simLineBuf, "OK") == 0) {
+        gotFinalOk = true;
+        break;
+      }
+
+      if (!inSender && strstr(g_simLineBuf, "+CMGR:")) {
+        char* firstQuote = strchr(g_simLineBuf, '"');
+        if (firstQuote) {
+          firstQuote++;
+          char* secondQuote = strchr(firstQuote, '"');
+          if (secondQuote) {
+            secondQuote++;
+            char* thirdQuote = strchr(secondQuote, '"');
+            if (thirdQuote) {
+              thirdQuote++;
+              char* fourthQuote = strchr(thirdQuote, '"');
+              if (fourthQuote) {
+                int senderLen = fourthQuote - thirdQuote;
+                if (senderLen > 15) senderLen = 15;
+                strncpy(sender, thirdQuote, senderLen);
+                sender[senderLen] = '\0';
+                inSender = true;
+              }
+            }
+          }
+        }
+      } else if (inSender && !inMsg && g_simLineBuf[0] != '\0' && g_simLineBuf[0] != '\r') {
+        inMsg = true;
+        strncpy(msg, g_simLineBuf, sizeof(msg) - 1);
+        msg[sizeof(msg) - 1] = '\0';
+        msgIdx = strlen(msg);
+      } else if (inMsg) {
+        if (msgIdx + len < (int)sizeof(msg) - 2) {
+          strcat(msg, "\n");
+          strcat(msg, g_simLineBuf);
+          msgIdx = strlen(msg);
+        }
+      }
+    }
+    if (gotFinalOk) break;
+    delay(10);
+  }
+
+  trimInPlace(msg);
+
+  if (sender[0] != '\0') {
+    DEBUG_PRINT(F("SMS from ")); DEBUG_PRINT(sender); DEBUG_PRINT(F(": ")); DEBUG_PRINTLN(msg);
+    if (equalsIgnoreCase(msg, "OPEN") || equalsIgnoreCase(msg, "ОТКРЫТЬ")) {
+      DEBUG_PRINTLN(F("Open command received via SMS"));
+      openGate();
+      sendLog_P(F("open"), sender, -1, F("success"), F("sms"));
+    } else if (equalsIgnoreCase(msg, "CLOSE") || equalsIgnoreCase(msg, "ЗАКРЫТЬ")) {
+      DEBUG_PRINTLN(F("Close command received via SMS"));
+      closeGate();
+      sendLog_P(F("close"), sender, -1, F("success"), F("sms"));
+    } else {
+      DEBUG_PRINTLN(F("Unknown SMS command"));
+      sendLog_Str(F("sms"), sender, -1, F("unknown"), msg);
+    }
+  } else {
+    DEBUG_PRINTLN(F("SMS parse: no sender"));
+  }
+
+  sim800.print(F("AT+CMGD="));
+  sim800.println(index);
+  delay(300);
+  flushSIM800();
+}
+
+// ======================== Команды с сервера =============
+// Разбор только ответа action=commands (без ArduinoJson — экономия SRAM/Flash)
+static void stripForJsonField(char* s) {
+  if (!s) return;
+  for (char* p = s; *p; p++) {
+    if ((unsigned char)*p < 32 || *p == '"' || *p == '\\') *p = ' ';
+  }
+}
+
+// Читает строки до OK/ERROR до ~25 с, собирает текст из +CUSD: ... "..."
+// SIM800 часто шлёт строку OK *до* +CUSD: — ранний OK даёт пустой result и ложный «успех».
+static bool readUssdResponseInto(char* out, size_t outSz) {
+  if (!out || outSz < 4) return false;
+  out[0] = '\0';
+  size_t len = 0;
+  unsigned long t0 = millis();
+  bool gotOk = false;
+  bool gotErr = false;
+  bool seenCusd = false;
+  while (millis() - t0 < 25000UL && !gotOk && !gotErr) {
+    while (sim800.available()) {
+      int n = sim800.readBytesUntil('\n', g_simLineBuf, sizeof(g_simLineBuf) - 1);
+      g_simLineBuf[n] = '\0';
+      trimInPlace(g_simLineBuf);
+      if (g_simLineBuf[0] == '\0') continue;
+      SIM800_LOG(g_simLineBuf);
+      captureClipFromLine(g_simLineBuf);
+      const char* cu = strstr(g_simLineBuf, "+CUSD:");
+      if (cu) {
+        seenCusd = true;
+        const char* q1 = strchr(cu + 6, '"');
+        if (q1) {
+          q1++;
+          const char* q2 = strchr(q1, '"');
+          if (q2 && q2 > q1) {
+            size_t piece = (size_t)(q2 - q1);
+            if (len > 0 && len + 1 < outSz) {
+              out[len++] = ' ';
+              out[len] = '\0';
+            }
+            if (len + piece >= outSz - 1) piece = outSz - 1 - len;
+            if (piece > 0) {
+              memcpy(out + len, q1, piece);
+              len += piece;
+              out[len] = '\0';
+            }
+          }
+        }
+        continue;
+      }
+      if (strcmp(g_simLineBuf, "OK") == 0) {
+        if (seenCusd) {
+          gotOk = true;
+          break;
+        }
+        continue;
+      }
+      if (strstr(g_simLineBuf, "ERROR") != NULL || strstr(g_simLineBuf, "+CME ERROR") != NULL
+          || strstr(g_simLineBuf, "+CMS ERROR") != NULL) {
+        gotErr = true;
+        break;
+      }
+    }
+    if (gotOk || gotErr) break;
+    delay(10);
+  }
+  if (!gotOk && !gotErr && seenCusd) {
+    gotOk = true;
+  }
+  stripForJsonField(out);
+  return gotOk && !gotErr;
+}
+
+static bool jsonCopyStringField(const char* start, const char* end, const char* key, char* out, size_t outSz) {
+  if (!start || !end || start >= end || !key || !out || outSz == 0) return false;
+  char pat[20];
+  int n = snprintf_P(pat, sizeof(pat), PSTR("\"%s\""), key);
+  if (n <= 0 || (size_t)n >= sizeof(pat)) return false;
+  const char* p = strstr(start, pat);
+  if (!p || p >= end) return false;
+  p = strchr(p + n, ':');
+  if (!p || p >= end) return false;
+  p++;
+  while (p < end && (*p == ' ' || *p == '\t')) p++;
+  if (p >= end || *p != '"') return false;
+  p++;
+  size_t i = 0;
+  while (p < end && *p && *p != '"' && i < outSz - 1) out[i++] = *p++;
+  out[i] = '\0';
+  return true;
+}
+
+void checkServerCommands() {
+  DEBUG_PRINTLN(F("Checking server commands..."));
+  if (!gprsReady) {
+    DEBUG_PRINTLN(F("GPRS not ready, skipping"));
+    return;
+  }
+  sprintf_P(g_urlBuf, PSTR("http://%s/?action=commands"), SERVER_URL);
+  if (!httpGet(g_urlBuf)) {
+    DEBUG_PRINTLN(F("HTTP commands failed"));
+    return;
+  }
+
+  // В ответе commands может быть несколько разных типов.
+  // Парсим lightweight-способом (без ArduinoJson) блоками по "id".
+  int cmdCount = 0;
+  const char* p = httpBuffer;
+  while (p && *p) {
+    const char* idTag = strstr(p, "\"id\":");
+    if (!idTag) break;
+    const char* nextId = strstr(idTag + 5, "\"id\":");
+    const char* blockEnd = nextId ? nextId : (httpBuffer + strlen(httpBuffer));
+
+    const char* pnum = idTag + 5;
+    while (*pnum == ' ' || *pnum == '\t') pnum++;
+    int id = atoi(pnum);
+
+    char typeBuf[12];
+    if (!jsonCopyStringField(idTag, blockEnd, "type", typeBuf, sizeof(typeBuf))) {
+      p = blockEnd;
+      continue;
+    }
+
+    cmdCount++;
+    DEBUG_PRINT(F("Command ")); DEBUG_PRINT(id); DEBUG_PRINT(F(" type: ")); DEBUG_PRINTLN(typeBuf);
+
+    if (strcmp(typeBuf, "send_sms") == 0) {
+      char phoneBuf[16];
+      if (!jsonCopyStringField(idTag, blockEnd, "phone", phoneBuf, sizeof(phoneBuf))) {
+        DEBUG_PRINTLN(F("send_sms: no phone"));
+        p = blockEnd;
+        continue;
+      }
+      if (!jsonCopyStringField(idTag, blockEnd, "message", g_logJsonBuf, sizeof(g_logJsonBuf))) {
+        DEBUG_PRINTLN(F("send_sms: no message"));
+        p = blockEnd;
+        continue;
+      }
+      DEBUG_PRINT(F("Sending SMS to ")); DEBUG_PRINT(phoneBuf); DEBUG_PRINT(F(": ")); DEBUG_PRINTLN(g_logJsonBuf);
+
+      sim800.print(F("AT+CMGS=\""));
+      sim800.print(phoneBuf);
+      sim800.println(F("\""));
+      if (!waitForResponse(">", 5000)) {
+        DEBUG_PRINTLN(F("Failed to get SMS prompt"));
+        p = blockEnd;
+        continue;
+      }
+      sim800.print(g_logJsonBuf);
+      sim800.write(26);
+      delay(5000);
+
+      char ackData[36];
+      sprintf_P(ackData, PSTR("{\"id\":%d,\"status\":\"sent\"}"), id);
+      sprintf_P(g_urlBuf, PSTR("http://%s/?action=command_ack"), SERVER_URL);
+      httpPost(g_urlBuf, ackData);
+      DEBUG_PRINTLN(F("SMS sent, ack posted"));
+    } else if (strcmp(typeBuf, "close_gate") == 0) {
+      DEBUG_PRINTLN(F("Close gate command from server"));
+      closeGate();
+      sendLog_P(F("close"), NULL, -1, F("success"), F("srv"));
+
+      char ackData[36];
+      sprintf_P(ackData, PSTR("{\"id\":%d,\"status\":\"sent\"}"), id);
+      sprintf_P(g_urlBuf, PSTR("http://%s/?action=command_ack"), SERVER_URL);
+      httpPost(g_urlBuf, ackData);
+    } else if (strcmp(typeBuf, "send_ussd") == 0) {
+      char codeBuf[32];
+      if (!jsonCopyStringField(idTag, blockEnd, "code", codeBuf, sizeof(codeBuf))) {
+        DEBUG_PRINTLN(F("send_ussd: no code"));
+        p = blockEnd;
+        continue;
+      }
+      DEBUG_PRINT(F("USSD: ")); DEBUG_PRINTLN(codeBuf);
+      flushSIM800();
+      sim800.print(F("AT+CUSD=1,\""));
+      sim800.print(codeBuf);
+      sim800.println(F("\",15"));
+      memset(g_ussdScratch, 0, sizeof(g_ussdScratch));
+      bool ussdOk = readUssdResponseInto(g_ussdScratch, sizeof(g_ussdScratch));
+      if (!ussdOk) {
+        DEBUG_PRINTLN(F("USSD: no OK or modem ERROR"));
+        if (g_ussdScratch[0] == '\0') {
+          strncpy_P(g_ussdScratch, PSTR("ERROR"), sizeof(g_ussdScratch) - 1);
+          g_ussdScratch[sizeof(g_ussdScratch) - 1] = '\0';
+        }
+      }
+      if (strlen(g_ussdScratch) > 44) g_ussdScratch[44] = '\0';
+      stripForJsonField(g_ussdScratch);
+      snprintf_P(g_logJsonBuf, sizeof(g_logJsonBuf),
+                 PSTR("{\"id\":%d,\"status\":\"%s\",\"kind\":\"ussd\",\"result\":\"%s\"}"),
+                 id, ussdOk ? "sent" : "failed", g_ussdScratch);
+      sprintf_P(g_urlBuf, PSTR("http://%s/?action=command_ack"), SERVER_URL);
+      httpPost(g_urlBuf, g_logJsonBuf);
+      DEBUG_PRINTLN(F("USSD command_ack posted"));
+    }
+
+    p = blockEnd;
+  }
+  if (cmdCount == 0) {
+    DEBUG_PRINTLN(F("No pending commands"));
+  }
+}
+
+// ======================== Логирование ===================
+static void copyFlashToBuf(const __FlashStringHelper* f, char* dst, size_t n) {
+  if (!dst || n == 0) return;
+  if (!f) {
+    dst[0] = '\0';
+    return;
+  }
+  strncpy_P(dst, (const char*)f, n - 1);
+  dst[n - 1] = '\0';
+}
+
+static bool gatewayLogAllowedByLevel(const char* ev, const char* st) {
+  uint8_t lv = g_gatewayLogLevel;
+  if (lv >= 2) return true;
+  if (lv == 0) return false;
+  if (strcmp(ev, "call") == 0) {
+    if (strcmp(st, "received") == 0) return false;
+    if (strcmp(st, "ignored") == 0) return false;
+  }
+  return true;
+}
+
+static void sendLogPayload(const char* ev, const char* pn, int group, const char* st, const char* det) {
+  if (!gprsReady) {
+    DEBUG_PRINTLN(F("GPRS not ready, log not sent"));
+    return;
+  }
+  if (isRamLow()) {
+    DEBUG_PRINTLN(F("sendLog skip (low RAM)"));
+    return;
+  }
+  if (!gatewayLogAllowedByLevel(ev, st)) return;
+
+  int outLen;
+  if (group >= 0) {
+    outLen = snprintf_P(g_logJsonBuf, sizeof(g_logJsonBuf),
+                        PSTR("[{\"t\":\"%s\",\"p\":\"%s\",\"g\":%d,\"s\":\"%s\",\"d\":\"%s\"}]"),
+                        ev, pn, group, st, det);
+  } else {
+    outLen = snprintf_P(g_logJsonBuf, sizeof(g_logJsonBuf),
+                        PSTR("[{\"t\":\"%s\",\"p\":\"%s\",\"g\":null,\"s\":\"%s\",\"d\":\"%s\"}]"),
+                        ev, pn, st, det);
+  }
+  if (outLen <= 0 || (unsigned)outLen >= sizeof(g_logJsonBuf)) {
+    DEBUG_PRINTLN(F("Log JSON overflow"));
+    return;
+  }
+  sprintf_P(g_urlBuf, PSTR("http://%s/?action=log"), SERVER_URL);
+  httpPost(g_urlBuf, g_logJsonBuf);
+}
+
+void sendLog_P(const __FlashStringHelper* type, const char* number, int group, const __FlashStringHelper* status, const __FlashStringHelper* details) {
+  copyFlashToBuf(type, g_logEv, sizeof(g_logEv));
+  copyFlashToBuf(status, g_logSt, sizeof(g_logSt));
+  copyFlashToBuf(details, g_logDet, sizeof(g_logDet));
+  sendLogPayload(g_logEv, number ? number : "", group, g_logSt, g_logDet);
+}
+
+void sendLog_Str(const __FlashStringHelper* type, const char* number, int group, const __FlashStringHelper* status, const char* details) {
+  copyFlashToBuf(type, g_logEv, sizeof(g_logEv));
+  copyFlashToBuf(status, g_logSt, sizeof(g_logSt));
+  const char* src = details ? details : "";
+  char detSan[36];
+  const size_t maxDet = sizeof(detSan) - 1;
+  size_t n = 0;
+  while (src[n] != '\0' && n < maxDet) {
+    char c = src[n];
+    if (c == '"' || c == '\\') c = '.';
+    if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+    detSan[n++] = (char)(uint8_t)c;
+  }
+  detSan[n] = '\0';
+  sendLogPayload(g_logEv, number ? number : "", group, g_logSt, detSan);
+}
+
+// ======================== HTTP функции (улучшенные) =====
+bool httpGet(const char* url) {
+  if (isRamLow()) {
+    DEBUG_PRINTLN(F("Low RAM guard: skip HTTP GET"));
+    return false;
+  }
+  if (!gprsReady) {
+    DEBUG_PRINTLN(F("GPRS not ready"));
+    return false;
+  }
+  DEBUG_PRINT(F("HTTP GET: "));
+  DEBUG_PRINTLN(url);
+  int fr = freeRam();
+  if (fr < minFreeRam) minFreeRam = fr;
+  DEBUG_PRINT(F("freeRam before HTTP GET: "));
+  DEBUG_PRINTLN(fr);
+  flushSIM800();
+  memset(httpBuffer, 0, sizeof(httpBuffer));
+
+  sim800.println(F("AT+HTTPTERM"));
+  (void)waitForResponse("OK", 2000, false);
+  delay(200);
+
+  sim800.println(F("AT+HTTPINIT"));
+  if (!waitForResponse("OK", 5000)) {
+    DEBUG_PRINTLN(F("HTTPINIT failed"));
+    return false;
+  }
+
+  sim800.println(F("AT+HTTPPARA=\"CID\",1"));
+  if (!waitForResponse("OK", 5000, false)) {
+    DEBUG_PRINTLN(F("HTTP CID setup failed"));
+    sim800.println(F("AT+HTTPTERM"));
+    return false;
+  }
+
+  sim800.print(F("AT+HTTPPARA=\"URL\",\""));
+  sim800.print(url);
+  sim800.println(F("\""));
+  if (!waitForResponse("OK", 5000)) {
+    DEBUG_PRINTLN(F("HTTPPARA URL failed"));
+    sim800.println(F("AT+HTTPTERM"));
+    return false;
+  }
+
+  sim800.print(F("AT+HTTPPARA=\"USERDATA\",\"Authorization: Bearer "));
+  sim800.print(header.apiToken);
+  sim800.println(F("\""));
+  if (!waitForResponse("OK", 3000, false)) {
+    DEBUG_PRINTLN(F("HTTP auth header not accepted, continuing"));
+  }
+
+  sim800.println(F("AT+HTTPPARA=\"TIMEOUT\",30000"));
+  if (!waitForResponse("OK", 3000, false)) {
+    DEBUG_PRINTLN(F("HTTP timeout setup not accepted, continuing"));
+  }
+
+  sim800.println(F("AT+HTTPACTION=0"));
+  unsigned long start = millis();
+  int httpStatus = 0;
+  int dataLen = 0;
+  bool gotAction = false;
+
+  while (millis() - start < 45000) {
+    if (sim800.available()) {
+      memset(g_simLineBuf, 0, sizeof(g_simLineBuf));
+      int len = sim800.readBytesUntil('\n', g_simLineBuf, sizeof(g_simLineBuf) - 1);
+      g_simLineBuf[len] = '\0';
+      trimInPlace(g_simLineBuf);
+      if (strlen(g_simLineBuf) == 0) continue;
+      captureClipFromLine(g_simLineBuf);
+      SIM800_LOG(g_simLineBuf);
+
+      if (strstr(g_simLineBuf, "+HTTPACTION:") != NULL) {
+        char* p = g_simLineBuf + 12;
+        while (*p == ' ') p++;
+        p = strchr(p, ',');
+        if (p) {
+          p++;
+          httpStatus = atoi(p);
+          p = strchr(p, ',');
+          if (p) {
+            p++;
+            dataLen = atoi(p);
+          }
+        }
+        gotAction = true;
+        DEBUG_PRINT(F("HTTP status: "));
+        DEBUG_PRINTLN(httpStatus);
+        DEBUG_PRINT(F("Data length: "));
+        DEBUG_PRINTLN(dataLen);
+        break;
+      }
+    }
+  }
+
+  if (!gotAction) {
+    DEBUG_PRINTLN(F("No HTTPACTION response"));
+    sim800.println(F("AT+HTTPTERM"));
+    return false;
+  }
+
+  if (httpStatus != 200) {
+    DEBUG_PRINT(F("HTTP error: "));
+    DEBUG_PRINTLN(httpStatus);
+    sim800.println(F("AT+HTTPTERM"));
+    if (httpStatus == 403) {
+      DEBUG_PRINTLN(F("HTTP 403: bad API token (fix DB prev grace or flash token; no auto-fallback)"));
+    }
+    return false;
+  }
+
+  if (dataLen == 0) {
+    DEBUG_PRINTLN(F("No data"));
+    sim800.println(F("AT+HTTPTERM"));
+    return false;
+  }
+
+  sim800.println(F("AT+HTTPREAD"));
+  start = millis();
+  bool gotRead = false;
+  int readLen = 0;
+  while (millis() - start < 5000) {
+    if (sim800.available()) {
+      memset(g_simLineBuf, 0, sizeof(g_simLineBuf));
+      int lr = sim800.readBytesUntil('\n', g_simLineBuf, sizeof(g_simLineBuf) - 1);
+      g_simLineBuf[lr] = '\0';
+      trimInPlace(g_simLineBuf);
+      if (strlen(g_simLineBuf) == 0) continue;
+      captureClipFromLine(g_simLineBuf);
+      SIM800_LOG(g_simLineBuf);
+      if (strstr(g_simLineBuf, "+HTTPREAD:") != NULL) {
+        char* rp = g_simLineBuf + 10;
+        while (*rp == ' ') rp++;
+        readLen = atoi(rp);
+        gotRead = true;
+        break;
+      }
+    }
+  }
+
+  if (!gotRead) {
+    DEBUG_PRINTLN(F("No HTTPREAD response"));
+    sim800.println(F("AT+HTTPTERM"));
+    return false;
+  }
+
+  int idx = 0;
+  start = millis();
+  int bodyTotal = readLen > 0 ? readLen : dataLen;
+  if (bodyTotal > dataLen) bodyTotal = dataLen;
+  unsigned long tBody = millis();
+  while (millis() - tBody < 5000 && idx < bodyTotal && idx < HTTP_BUFFER_SIZE - 1) {
+    if (sim800.available()) {
+      httpBuffer[idx++] = (char)sim800.read();
+    }
+  }
+  int consumed = idx;
+  unsigned long tDrain = millis();
+  while (millis() - tDrain < 8000 && consumed < bodyTotal) {
+    if (sim800.available()) {
+      (void)sim800.read();
+      consumed++;
+    }
+  }
+  httpBuffer[idx] = '\0';
+  waitForResponse("OK", 2000, false);
+  sim800.println(F("AT+HTTPTERM"));
+  (void)waitForResponse("OK", 2000, false);
+  delay(200);
+  DEBUG_PRINT(F("Response: "));
+  safePrintln(httpBuffer);
+  fr = freeRam();
+  if (fr < minFreeRam) minFreeRam = fr;
+  DEBUG_PRINT(F("freeRam after HTTP GET: "));
+  DEBUG_PRINTLN(fr);
+  return (idx > 0);
+}
+
+bool httpPost(const char* url, const char* data) {
+  if (isRamLow()) {
+    DEBUG_PRINTLN(F("Low RAM guard: skip HTTP POST"));
+    return false;
+  }
+  if (!gprsReady) {
+    DEBUG_PRINTLN(F("GPRS not ready"));
+    return false;
+  }
+  DEBUG_PRINT(F("HTTP POST: ")); DEBUG_PRINTLN(url);
+  DEBUG_PRINT(F("POST body len: ")); DEBUG_PRINTLN(strlen(data));
+  DEBUG_PRINT(F("POST body: ")); safePrintln(data);
+  flushSIM800();
+
+  sim800.println(F("AT+HTTPTERM"));
+  (void)waitForResponse("OK", 2000, false);
+  delay(200);
+
+  sim800.println(F("AT+HTTPINIT"));
+  if (!waitForResponse("OK", 5000)) {
+    DEBUG_PRINTLN(F("HTTPINIT failed"));
+    return false;
+  }
+
+  sim800.println(F("AT+HTTPPARA=\"CID\",1"));
+  if (!waitForResponse("OK", 5000, false)) {
+    DEBUG_PRINTLN(F("HTTP CID setup failed"));
+    sim800.println(F("AT+HTTPTERM"));
+    return false;
+  }
+
+  sim800.print(F("AT+HTTPPARA=\"URL\",\""));
+  sim800.print(url);
+  sim800.println(F("\""));
+  if (!waitForResponse("OK", 5000)) {
+    DEBUG_PRINTLN(F("HTTPPARA URL failed"));
+    sim800.println(F("AT+HTTPTERM"));
+    return false;
+  }
+
+  sim800.print(F("AT+HTTPPARA=\"USERDATA\",\"Authorization: Bearer "));
+  sim800.print(header.apiToken);
+  sim800.println(F("\""));
+  if (!waitForResponse("OK", 3000, false)) {
+    DEBUG_PRINTLN(F("HTTP auth header not accepted, continuing"));
+  }
+
+  sim800.println(F("AT+HTTPPARA=\"CONTENT\",\"application/json\""));
+  if (!waitForResponse("OK", 3000, false)) {
+    DEBUG_PRINTLN(F("HTTP content type not accepted, continuing"));
+  }
+
+  sim800.println(F("AT+HTTPPARA=\"TIMEOUT\",30000"));
+  if (!waitForResponse("OK", 3000, false)) {
+    DEBUG_PRINTLN(F("HTTP timeout setup not accepted, continuing"));
+  }
+
+  sim800.print(F("AT+HTTPDATA="));
+  sim800.print(strlen(data));
+  sim800.println(F(",30000"));
+  if (!waitForResponse("DOWNLOAD", 10000)) {
+    DEBUG_PRINTLN(F("HTTPDATA failed"));
+    sim800.println(F("AT+HTTPTERM"));
+    return false;
+  }
+
+  sim800.print(data);
+  delay(1000);
+
+  sim800.println(F("AT+HTTPACTION=1"));
+  unsigned long start = millis();
+  int httpStatus = 0;
+  bool gotAction = false;
+
+  while (millis() - start < 30000) {
+    if (sim800.available()) {
+      memset(g_simLineBuf, 0, sizeof(g_simLineBuf));
+      int len = sim800.readBytesUntil('\n', g_simLineBuf, sizeof(g_simLineBuf) - 1);
+      g_simLineBuf[len] = '\0';
+      trimInPlace(g_simLineBuf);
+      if (strlen(g_simLineBuf) == 0) continue;
+      captureClipFromLine(g_simLineBuf);
+      SIM800_LOG(g_simLineBuf);
+      if (strstr(g_simLineBuf, "+HTTPACTION:") != NULL) {
+        char* p = g_simLineBuf + 12;
+        while (*p == ' ') p++;
+        p = strchr(p, ',');
+        if (p) {
+          p++;
+          httpStatus = atoi(p);
+        }
+        gotAction = true;
+        break;
+      }
+    }
+  }
+
+  if (!gotAction) {
+    DEBUG_PRINTLN(F("No HTTPACTION response"));
+    sim800.println(F("AT+HTTPTERM"));
+    return false;
+  }
+
+  if (httpStatus != 200 && httpStatus != 201 && httpStatus != 204) {
+    DEBUG_PRINT(F("HTTP error: ")); DEBUG_PRINTLN(httpStatus);
+    sim800.println(F("AT+HTTPTERM"));
+    if (httpStatus == 403) {
+      DEBUG_PRINTLN(F("HTTP 403 POST: bad API token (see admin token / prev grace)"));
+    }
+    return false;
+  }
+
+  sim800.println(F("AT+HTTPTERM"));
+  (void)waitForResponse("OK", 2000, false);
+  delay(200);
+
+  DEBUG_PRINTLN(F("POST completed"));
+  return true;
+}
+
+// ======================== Утилиты =======================
+bool waitForResponse(const char* expected, int timeout, bool printLines) {
+  unsigned long start = millis();
+  uint8_t lineLen = 0;
+  g_simLineBuf[0] = '\0';
+
+  while (millis() - start < (unsigned long)timeout) {
+    if (sim800.available()) {
+      char c = sim800.read();
+
+      if (c == '\n') {
+        if (lineLen > 0) {
+          g_simLineBuf[lineLen] = '\0';
+          captureClipFromLine(g_simLineBuf);
+          if (printLines) {
+            SIM800_LOG(g_simLineBuf);
+          }
+          if (expected && strstr(g_simLineBuf, expected) != NULL) {
+            return true;
+          }
+        }
+        lineLen = 0;
+        g_simLineBuf[0] = '\0';
+      } else if (c != '\r') {
+        if (lineLen < sizeof(g_simLineBuf) - 1) {
+          g_simLineBuf[lineLen++] = c;
+          g_simLineBuf[lineLen] = '\0';
+          // Иногда "OK" приходит без LF — проверяем и в процессе набора.
+          if (expected && strstr(g_simLineBuf, expected) != NULL) {
+            captureClipFromLine(g_simLineBuf);
+            if (printLines) {
+              SIM800_LOG(g_simLineBuf);
+            }
+            return true;
+          }
+        }
+      }
+    }
+    else {
+      delay(1);
+    }
+  }
+  DEBUG_PRINT(F("Timeout waiting for: ")); DEBUG_PRINTLN(expected);
+  return false;
+}
+
+void flushSIM800() {
+  // Защита от "вечного" flush при непрерывных URC.
+  unsigned long t0 = millis();
+  while (millis() - t0 < 250UL) {
+    bool had = false;
+    while (sim800.available()) {
+      (void)sim800.read();
+      had = true;
+    }
+    if (!had) break;
+    delay(1);
+  }
+}
+
+int freeRam() {
+  extern unsigned int __heap_start;
+  extern void* __brkval;
+  char stackTop;
+  return (int)&stackTop - (int)(__brkval ? __brkval : (void*)&__heap_start);
+}
+
+bool isRamLow() {
+  return freeRam() < LOW_RAM_GUARD;
+}
+
+void parseClipNumber(const char* line, char* out, size_t outSize) {
+  if (!out || outSize == 0) return;
+  out[0] = '\0';
+  if (!line) return;
+
+  const char* clip = strstr(line, "+CLIP:");
+  if (!clip) return;
+
+  const char* p = clip + 6;
+  while (*p == ' ' || *p == '\t') p++;
+
+  const char* numStart = NULL;
+  size_t rawLen = 0;
+
+  if (*p == '"') {
+    p++;
+    numStart = p;
+    const char* qclose = strchr(p, '"');
+    const char* comma = strchr(p, ',');
+    const char* end = NULL;
+    if (qclose && (!comma || qclose < comma)) {
+      end = qclose;
+    } else if (comma) {
+      end = comma;
+    } else {
+      end = p + strlen(p);
+    }
+    if (end > numStart) rawLen = (size_t)(end - numStart);
+  } else {
+    numStart = p;
+    const char* comma = strchr(p, ',');
+    if (comma) rawLen = (size_t)(comma - p);
+    else rawLen = strlen(p);
+  }
+
+  if (rawLen == 0 || rawLen > 24) return;
+
+  char tmp[24];
+  if (rawLen >= sizeof(tmp)) rawLen = sizeof(tmp) - 1;
+  memcpy(tmp, numStart, rawLen);
+  tmp[rawLen] = '\0';
+  normalizePhone(tmp, out, outSize);
+}
+
+void captureClipFromLine(const char* line) {
+  if (!line) return;
+  if (strncmp_P(line, PSTR("+CLIP:"), 6) != 0) return;
+  parseClipNumber(line, callerNumber, sizeof(callerNumber));
+  if (callerNumber[0] != '\0') {
+    g_pendingProcessCall = true;
+  }
+}
+
+// Опрос UART во время импульса реле: CMTI сохраняем; +CLIP — только если acceptIncomingCallClip (иначе ложное повторное открытие)
+void pumpSim800OnePass(bool acceptIncomingCallClip) {
+  while (sim800.available()) {
+    memset(g_simLineBuf, 0, sizeof(g_simLineBuf));
+    int len = sim800.readBytesUntil('\n', g_simLineBuf, sizeof(g_simLineBuf) - 1);
+    g_simLineBuf[len] = '\0';
+    if (strlen(g_simLineBuf) == 0) continue;
+    if (acceptIncomingCallClip) {
+      captureClipFromLine(g_simLineBuf);
+    }
+    SIM800_LOG(g_simLineBuf);
+    if (acceptIncomingCallClip && strncmp_P(g_simLineBuf, PSTR("+CLIP:"), 6) == 0 && callerNumber[0] != '\0') {
+      DEBUG_PRINT(F("Incoming call from: ")); DEBUG_PRINTLN(callerNumber);
+    } else if (strncmp_P(g_simLineBuf, PSTR("+CMTI:"), 6) == 0) {
+      char* comma = strrchr(g_simLineBuf, ',');
+      if (comma) {
+        int index = atoi(comma + 1);
+        if (g_pendingSmsIndex < 0) g_pendingSmsIndex = index;
+      }
+    }
+  }
+}
+
+void pumpSim800ClipWhile(unsigned long totalMs, bool acceptIncomingCallClip) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < totalMs) {
+    pumpSim800OnePass(acceptIncomingCallClip);
+    delay(1);
+  }
+}
+
+void normalizePhone(const char* src, char* dst, size_t dstSize) {
+  if (!dst || dstSize < 13) {
+    if (dst && dstSize) dst[0] = '\0';
+    return;
+  }
+  dst[0] = '\0';
+  if (!src) return;
+
+  char d[32];
+  unsigned n = 0;
+  for (const char* p = src; *p && n < sizeof(d) - 1; p++) {
+    if (*p >= '0' && *p <= '9') d[n++] = *p;
+  }
+  d[n] = '\0';
+  if (n < 9) return;
+
+  // 9 цифр после потери ведущей 7 (пробелы/мусор во флеше): 8…/9… -> 7 + …
+  if (n == 9 && (d[0] == '8' || d[0] == '9')) {
+    memmove(d + 1, d, 9);
+    d[0] = '7';
+    n = 10;
+    d[10] = '\0';
+  }
+  if (n < 10) return;
+
+  // Потерян ведущий 7: во флеше «900…» (11 цифр) вместо «7900…»
+  if (n == 11 && d[0] == '9' && d[1] == '0') {
+    memmove(d + 1, d, 11);
+    d[0] = '7';
+    n = 12;
+    d[12] = '\0';
+  }
+
+  // 12 цифр 79… (например 790032646442) — + и все 12
+  if (n == 12 && d[0] == '7' && d[1] == '9' && dstSize >= 14) {
+    dst[0] = '+';
+    memcpy(dst + 1, d, 12);
+    dst[13] = '\0';
+    return;
+  }
+
+  // Порча: 70xxxxxxxxx вместо 79xxxxxxxxx
+  if (n == 11 && d[0] == '7' && d[1] == '0') {
+    d[1] = '9';
+  }
+
+  // Длинная строка: первое окно «7» + 10 национальных (8… как 7…)
+  for (unsigned i = 0; i + 11 <= n; i++) {
+    char c0 = d[i];
+    if (c0 == '8') c0 = '7';
+    if (c0 == '7') {
+      dst[0] = '+';
+      dst[1] = '7';
+      memcpy(dst + 2, d + i + 1, 10);
+      dst[12] = '\0';
+      return;
+    }
+  }
+
+  // Приоритет мобильного 79… внутри длинной цепочки
+  for (unsigned i = 0; i + 11 <= n; i++) {
+    if (d[i] == '7' && d[i + 1] == '9') {
+      dst[0] = '+';
+      memcpy(dst + 1, d + i, 11);
+      dst[12] = '\0';
+      return;
+    }
+  }
+
+  // Ровно 10 последних цифр — национальный номер
+  memcpy(dst + 2, d + (n - 10), 10);
+  dst[0] = '+';
+  dst[1] = '7';
+  dst[12] = '\0';
+}
+
+void dumpNumbersFromFlash() {
+  DEBUG_PRINT(F("Dumping numbers from Flash. recordCount="));
+  DEBUG_PRINTLN(header.recordCount);
+  char phone[17];
+  uint8_t group = 0;
+  for (uint16_t i = 0; i < header.recordCount; i++) {
+    readRecord(i, phone, &group);
+    DEBUG_PRINT(F("["));
+    DEBUG_PRINT(i);
+    DEBUG_PRINT(F("] g="));
+    DEBUG_PRINT(group);
+    DEBUG_PRINT(F(" phone="));
+    DEBUG_PRINTLN(phone);
+  }
+}
